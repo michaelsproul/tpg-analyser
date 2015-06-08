@@ -79,7 +79,7 @@ downloadIndex sesh planId = do
 -- Parse the index page to form a list of "billing periods".
 parseIndex :: Response LB.ByteString -> Int -> IO [BillingPeriod]
 parseIndex response planId = do
-    nodes <- runX $ doc >>> css selector >>> (getInnerText &&& getAttrValue "href")
+    nodes <- runX $ doc >>> css selector >>> (arr getInnerText &&& getAttrValue "href")
     return (map createBillingPeriod nodes)
     where
         doc = responseToDoc response
@@ -98,24 +98,22 @@ getDataForPeriod :: S.Session -> Int -> BillingPeriod -> IO [Charge]
 getDataForPeriod sesh planId (BillingPeriod desc chargeId) = do
     page <- S.get sesh pageUrl
     let doc = responseToDoc page
-    cells <- runX $ doc >>> css "table[rules=all] tr td" >>> getInnerText
-    let rows = splitEvery 6 cells
-    return (map (rowToCharge . map trim) rows)
+    rows <- runX $ doc >>> css "table[rules=all] tr" >>> arr createRowFromNode
+    return (map rowToCharge rows)
     where
         pageUrl = baseUrl ++ getLinkPrefix planId ++ show chargeId
 
-splitEvery :: Int -> [a] -> [[a]]
-splitEvery _ [] = []
-splitEvery n l = start : (splitEvery n rest)
-    where (start, rest) = splitAt n l
+-- Convert an XML <tr> node to a list of strings containing the contents of its <tr> entries.
+createRowFromNode :: NTree XNode -> [String]
+createRowFromNode (NTree _ children) = map (trim . getInnerText) children
 
 -- Inefficient trim function.
 trim :: String -> String
 trim = f . f
    where f = reverse . dropWhile isSpace
 
-getInnerText :: Arrow a => a XmlTree String
-getInnerText = arr (\(NTree _ (child:_)) -> fromJust (XN.getText child))
+getInnerText :: NTree XNode -> String
+getInnerText (NTree _ (inner:_)) = fromJust (XN.getText inner)
 
 -- Convert a response to an XML document.
 responseToDoc :: Response LB.ByteString -> IOSArrow b (NTree XNode)
@@ -150,6 +148,7 @@ parseCallType _ = Nothing
 rowToCharge :: [String] -> Charge
 rowToCharge [time, ty, value, number, planCost, excessCost] =
     Charge time (parseCost planCost) (parseCost excessCost) (createChargeInfo ty value number)
+rowToCharge _ = Charge "" 0 0 $ Other "irregular row - doesn't have 5 columns"
 
 createChargeInfo :: String -> String -> String -> ChargeInfo
 createChargeInfo "SMS National" _ number = Sms number
