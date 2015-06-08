@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, ViewPatterns #-}
 
 module Data.TPG where
 
@@ -31,7 +31,12 @@ data BillingPeriod = BillingPeriod String Int deriving (Show)
 
 -- Type describing a single charge/cost.
 -- Charge (time of charge) (plan cost in cents) (excess cost in cents) (info)
-data Charge = Charge String Int Int ChargeInfo deriving (Show)
+data Charge = Charge {
+    time :: String,
+    planCost :: Int,
+    excessCost :: Int,
+    chargeInfo :: ChargeInfo
+} deriving (Show)
 
 -- Type describing the reason for a charge.
 data ChargeInfo =
@@ -48,6 +53,30 @@ data ChargeInfo =
 
 data CallType = Mobile | Landline | Tpg deriving (Show)
 
+isSms (chargeInfo -> Sms _) = True
+isSms _ = False
+
+isCall (chargeInfo -> Call _ _ _) = True
+isCall _ = False
+
+isMobileCall (chargeInfo -> Call Mobile _ _) = True
+isMobileCall _ = False
+
+isLandlineCall (chargeInfo -> Call Landline _ _) = True
+isLandlineCall _ = False
+
+isTpgCall (chargeInfo -> Call Tpg _ _) = True
+isTpgCall _ = False
+
+isData (chargeInfo -> Data _) = True
+isData _ = False
+
+isVoicemail (chargeInfo -> Voicemail _ _) = True
+isVoicemail _ = False
+
+isOther (chargeInfo -> Other _) = True
+isOther _ = False
+
 -- Login to the TPG user panel.
 login :: String -> String -> IO (S.Session)
 login username password = S.withSession $ \sesh -> do
@@ -61,6 +90,7 @@ login username password = S.withSession $ \sesh -> do
     S.post sesh indexUrl loginData
     return sesh
 
+-- Fetch the list of billing periods for a given plan ID.
 getBillingPeriods :: S.Session -> Int -> IO [BillingPeriod]
 getBillingPeriods sesh planId = do
     index <- downloadIndex sesh planId
@@ -76,7 +106,7 @@ downloadIndex sesh planId = do
 
     S.postWith opts sesh indexUrl (planSelection := ("Mobile+Usage" :: B.ByteString))
 
--- Parse the index page to form a list of "billing periods".
+-- Parse the index page to form a list of billing periods.
 parseIndex :: Response LB.ByteString -> Int -> IO [BillingPeriod]
 parseIndex response planId = do
     nodes <- runX $ doc >>> css selector >>> (arr getInnerText &&& getAttrValue "href")
@@ -88,7 +118,6 @@ parseIndex response planId = do
         createBillingPeriod (title, chargeId) = BillingPeriod title (createChargeId chargeId)
         createChargeId = read . fromJust . (stripPrefix linkPrefix)
 
-
 -- Get the string that appears at the beginning of all links for a given plan ID.
 getLinkPrefix :: Int -> String
 getLinkPrefix planId = printf "index.php?function=view_all_mobile&plan_id=%s&chg_id=" (show planId)
@@ -98,20 +127,14 @@ getDataForPeriod :: S.Session -> Int -> BillingPeriod -> IO [Charge]
 getDataForPeriod sesh planId (BillingPeriod desc chargeId) = do
     page <- S.get sesh pageUrl
     let doc = responseToDoc page
-    rows <- runX $ doc >>> css "table[rules=all] tr" >>> arr createRowFromNode
+    rows <- runX $ doc >>> css "table[rules=all] tr" >>> arr createRow
     return (map rowToCharge rows)
     where
         pageUrl = baseUrl ++ getLinkPrefix planId ++ show chargeId
+        -- Extract the string contents of an XML <tr> node's children.
+        createRow (NTree _ children) = map (trim . getInnerText) children
 
--- Convert an XML <tr> node to a list of strings containing the contents of its <tr> entries.
-createRowFromNode :: NTree XNode -> [String]
-createRowFromNode (NTree _ children) = map (trim . getInnerText) children
-
--- Inefficient trim function.
-trim :: String -> String
-trim = f . f
-   where f = reverse . dropWhile isSpace
-
+-- Fetch the text from within an XML node.
 getInnerText :: NTree XNode -> String
 getInnerText (NTree _ (inner:_)) = fromJust (XN.getText inner)
 
@@ -125,9 +148,8 @@ parseCost ('$':x) = round ((read x :: Float) * 100)
 
 -- Parse a data value like 1.50MB to an integer value in decimal kilobytes.
 parseDataUse :: String -> Int
-parseDataUse s = round ((read mb :: Float) * 1000)
-    where
-        mb = if "MB" `isSuffixOf` s then take (length s - 2) s else error "MB suffix not found"
+parseDataUse s = round (mb * 1000)
+    where mb = (read . fromJust . stripSuffix "MB") s
 
 -- Parse a duration in minutes like 10:15 to a duration in seconds.
 parseDuration :: String -> Int
@@ -136,6 +158,7 @@ parseDuration s = (read minutes) * 60 + read seconds
         colonIdx = fromJust (elemIndex ':' s)
         (minutes, ':':seconds) = splitAt colonIdx s
 
+-- Parse a call type string.
 parseCallType :: String -> Maybe CallType
 parseCallType "Call to landline" = Just Landline
 parseCallType "Info Service" = Just Landline
@@ -147,19 +170,19 @@ parseCallType _ = Nothing
 -- Convert a row of a charge table into a charge.
 rowToCharge :: [String] -> Charge
 rowToCharge [time, ty, value, number, planCost, excessCost] =
-    Charge time (parseCost planCost) (parseCost excessCost) (createChargeInfo ty value number)
+    Charge time (parseCost planCost) (parseCost excessCost) (createChargeInfo ty value number)f
 rowToCharge _ = Charge "" 0 0 $ Other "irregular row - doesn't have 5 columns"
 
 createChargeInfo :: String -> String -> String -> ChargeInfo
 createChargeInfo "SMS National" _ number = Sms number
 createChargeInfo v duration number
-    | v `elem` ["Voicemail Deposit", "Voicemail Retrieval"] = Voicemail number (parseDuration duration)
+    | v `elem` ["Voicemail Deposit", "Voicemail Retrieval"] =
+    Voicemail number (parseDuration duration)
 createChargeInfo d mb _
     | d `elem` ["Data", "Data (Volume based)"] = Data $ parseDataUse mb
-createChargeInfo callType duration number =
-    case parseCallType callType of
-        Just ty -> Call ty number (parseDuration duration)
-        Nothing -> Other callType
+createChargeInfo (parseCallType -> Just ty) duration number =
+    Call ty number (parseDuration duration)
+createChargeInfo desc _ _ = Other desc
 
 testSingle :: String -> String -> Int -> Int -> IO (BillingPeriod, [Charge])
 testSingle username password planId i = do
@@ -175,3 +198,12 @@ testAll username password planId = do
     bps <- getBillingPeriods sesh planId
     charges <- mapM (getDataForPeriod sesh planId) bps
     return (zip bps charges)
+
+-- Inefficient trim function.
+trim :: String -> String
+trim = f . f
+   where f = reverse . dropWhile isSpace
+
+-- Remove a suffix from a list.
+stripSuffix :: Eq a => [a] -> [a] -> Maybe [a]
+stripSuffix s l = if s `isSuffixOf` l then Just $ take (length l - length s) l else Nothing
