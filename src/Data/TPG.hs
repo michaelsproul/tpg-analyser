@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, ViewPatterns #-}
+{-# LANGUAGE OverloadedStrings, ViewPatterns, DeriveGeneric #-}
 
 module Data.TPG where
 
@@ -23,11 +23,14 @@ import qualified Text.XML.HXT.DOM.XmlNode as XN
 import Data.Tree.NTree.TypeDefs (NTree(..))
 import Text.HandsomeSoup
 
+import Data.Binary
+import GHC.Generics (Generic)
+
 baseUrl = "https://cyberstore.tpg.com.au/your_account/"
 indexUrl = baseUrl ++ "index.php"
 
 -- Type describing a month of billing.
-data BillingPeriod = BillingPeriod String Int deriving (Show)
+data BillingPeriod = BillingPeriod String Int deriving (Show, Generic)
 
 -- Type describing a single charge/cost.
 -- Charge (time of charge) (plan cost in cents) (excess cost in cents) (info)
@@ -36,7 +39,7 @@ data Charge = Charge {
     planCost :: Int,
     excessCost :: Int,
     chargeInfo :: ChargeInfo
-} deriving (Show)
+} deriving (Show, Generic)
 
 -- Type describing the reason for a charge.
 data ChargeInfo =
@@ -49,9 +52,15 @@ data ChargeInfo =
     -- Voicemail (number) (duration in seconds)
     Voicemail String Int |
     -- Misc
-    Other String deriving (Show)
+    Other String deriving (Show, Generic)
 
-data CallType = Mobile | Landline | Tpg deriving (Show)
+data CallType = Mobile | Landline | Tpg deriving (Show, Generic)
+
+-- Serialisation instances.
+instance Binary BillingPeriod
+instance Binary Charge
+instance Binary ChargeInfo
+instance Binary CallType
 
 isSms (chargeInfo -> Sms _) = True
 isSms _ = False
@@ -169,9 +178,10 @@ parseCallType _ = Nothing
 
 -- Convert a row of a charge table into a charge.
 rowToCharge :: [String] -> Charge
+-- Pay as you go format (6 columns).
 rowToCharge [time, ty, value, number, planCost, excessCost] =
-    Charge time (parseCost planCost) (parseCost excessCost) (createChargeInfo ty value number)f
-rowToCharge _ = Charge "" 0 0 $ Other "irregular row - doesn't have 5 columns"
+    Charge time (parseCost planCost) (parseCost excessCost) (createChargeInfo ty value number)
+rowToCharge _ = Charge "" 0 0 $ Other "irregular row - doesn't have an understood number of columns"
 
 createChargeInfo :: String -> String -> String -> ChargeInfo
 createChargeInfo "SMS National" _ number = Sms number
@@ -184,20 +194,28 @@ createChargeInfo (parseCallType -> Just ty) duration number =
     Call ty number (parseDuration duration)
 createChargeInfo desc _ _ = Other desc
 
-testSingle :: String -> String -> Int -> Int -> IO (BillingPeriod, [Charge])
-testSingle username password planId i = do
+-- Download the charges for a single (numbered) billing period.
+downloadSingle :: String -> String -> Int -> Int -> IO (BillingPeriod, [Charge])
+downloadSingle username password planId i = do
     sesh <- login username password
     bps <- getBillingPeriods sesh planId
     let bp = bps !! i
     charges <- getDataForPeriod sesh planId bp
     return (bp, charges)
 
-testAll :: String -> String -> Int -> IO [(BillingPeriod, [Charge])]
-testAll username password planId = do
+-- Download all the charges for a given plan ID.
+downloadAll :: String -> String -> Int -> IO [(BillingPeriod, [Charge])]
+downloadAll username password planId = do
     sesh <- login username password
     bps <- getBillingPeriods sesh planId
     charges <- mapM (getDataForPeriod sesh planId) bps
     return (zip bps charges)
+
+totalBy :: (Charge -> Int) -> (Charge -> Bool) -> [[Charge]] -> [Int]
+totalBy cost p charges = map (sum . map cost . filter p) charges
+
+avg :: [Int] -> Double
+avg l = fromIntegral (sum l) / fromIntegral (length l)
 
 -- Inefficient trim function.
 trim :: String -> String
