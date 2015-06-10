@@ -36,7 +36,8 @@ data BillingPeriod = BillingPeriod String Int deriving (Show, Generic)
 -- Charge (time of charge) (plan cost in cents) (excess cost in cents) (info)
 data Charge = Charge {
     time :: String,
-    planCost :: Int,
+    otherNetworkCost :: Int,
+    sameNetworkCost :: Int,
     excessCost :: Int,
     chargeInfo :: ChargeInfo
 } deriving (Show, Generic)
@@ -51,10 +52,12 @@ data ChargeInfo =
     Data Int |
     -- Voicemail (number) (duration in seconds)
     Voicemail String Int |
-    -- Misc
-    Other String deriving (Show, Generic)
+    -- Other charges.
+    Other String |
+    -- Parsing errors.
+    Error String deriving (Show, Generic)
 
-data CallType = Mobile | Landline | Tpg deriving (Show, Generic)
+data CallType = Mobile | Landline | Tpg | OneThree deriving (Show, Generic)
 
 -- Serialisation instances.
 instance Binary BillingPeriod
@@ -85,6 +88,12 @@ isVoicemail _ = False
 
 isOther (chargeInfo -> Other _) = True
 isOther _ = False
+
+isParseError (chargeInfo -> Error _) = True
+isParseError _ = False
+
+planCost :: Charge -> Int
+planCost c = otherNetworkCost c + sameNetworkCost c
 
 -- Login to the TPG user panel.
 login :: String -> String -> IO (S.Session)
@@ -174,14 +183,20 @@ parseCallType "Info Service" = Just Landline
 parseCallType "Mobile Call" = Just Mobile
 parseCallType "Call to non-Optus GSM" = Just Mobile
 parseCallType "TPG Mobile to TPG Mobile" = Just Tpg
+parseCallType "TPG Mobile to TPG Home Phone" = Just Tpg
+parseCallType "13 Numbers" = Just OneThree
 parseCallType _ = Nothing
 
 -- Convert a row of a charge table into a charge.
 rowToCharge :: [String] -> Charge
 -- Pay as you go format (6 columns).
-rowToCharge [time, ty, value, number, planCost, excessCost] =
-    Charge time (parseCost planCost) (parseCost excessCost) (createChargeInfo ty value number)
-rowToCharge _ = Charge "" 0 0 $ Other "irregular row - doesn't have an understood number of columns"
+rowToCharge [time, ty, value, number, inc, excess] =
+    Charge time (parseCost inc) 0 (parseCost excess) (createChargeInfo ty value number)
+-- Monthly plan format (8 columns).
+rowToCharge [time, ty, value, number, _, other, tpg, excess] =
+    Charge time (parseCost other) (parseCost tpg) (parseCost excess) ci
+    where ci = createChargeInfo ty value number
+rowToCharge _ = Charge "" 0 0 0 $ Error "irregular row not understood"
 
 createChargeInfo :: String -> String -> String -> ChargeInfo
 createChargeInfo "SMS National" _ number = Sms number
